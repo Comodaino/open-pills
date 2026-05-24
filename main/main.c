@@ -68,18 +68,15 @@ esp_err_t secrets_load(secrets_t *out)
 /* -----------------------------------------------------------------------
 * State machine
 * ----------------------------------------------------------------------- */
-#define NUM_STATES 6
+#define NUM_STATES 4
 
 void oled_update(const char *l1, const char *l2);  /* forward declaration */
 
 typedef enum state {
     STATE_INITIALIZING = 0,
-    STATE_WIFI_CONNECTING,
-    STATE_WIFI_CONNECTED,
     STATE_IDLE,
     STATE_TAKEN,
-    STATE_URGENT,
-    STATE_WAITING_FOR_00
+    STATE_URGENT
 } state_t;
 
 static state_t curr_state = STATE_INITIALIZING;
@@ -94,20 +91,11 @@ static void state_to_string(state_t s, char *buf, size_t buf_size) {
         case STATE_IDLE:
             strncpy(buf, "IDLE", buf_size);
             break;
-        case STATE_WIFI_CONNECTING:
-            strncpy(buf, "WIFI_CONNECTING", buf_size);
-            break;
-        case STATE_WIFI_CONNECTED:
-            strncpy(buf, "WIFI_CONNECTED", buf_size);
-            break;
         case STATE_TAKEN:
             strncpy(buf, "TAKEN", buf_size);
             break;
         case STATE_URGENT:
             strncpy(buf, "URGENT", buf_size);
-            break;
-        case STATE_WAITING_FOR_00:
-            strncpy(buf, "WAITING_FOR_00", buf_size);
             break;
         default:
             strncpy(buf, "UNKNOWN", buf_size);
@@ -119,7 +107,6 @@ static void set_state(state_t new_state) {
     curr_state = new_state;
     char state_str[32];
     state_to_string(new_state, state_str, sizeof(state_str));
-    oled_update("State changed to:", state_str);
     xSemaphoreGive(state_mtx);
 }
 
@@ -127,12 +114,15 @@ static void next_state() {
     xSemaphoreTake(state_mtx, portMAX_DELAY);
     curr_state++;
     curr_state = curr_state % NUM_STATES;
-    char state_str[32];
-    state_to_string(curr_state, state_str, sizeof(state_str));
-    oled_update("State changed to:", state_str);
     xSemaphoreGive(state_mtx);
 }
 
+static state_t get_state() {
+    xSemaphoreTake(state_mtx, portMAX_DELAY);
+    state_t s = curr_state;
+    xSemaphoreGive(state_mtx);
+    return s;
+}
 
 /* -----------------------------------------------------------------------
  * Wi-Fi
@@ -184,11 +174,7 @@ static void wifi_init_sta(void)
 }
 
 /* -----------------------------------------------------------------------
- * OLED
- *
- * The bus handle is static so both oled_init() and oled_show_status()
- * can reach it.  The ssd1306_handle type comes from k0i05/esp_ssd1306 —
- * check ssd1306.h for the exact init call if the one below doesn't match.
+ * OLED display via I2C
  * ----------------------------------------------------------------------- */
 #define OLED_SDA  GPIO_NUM_4
 #define OLED_SCL  GPIO_NUM_15
@@ -197,18 +183,6 @@ static void wifi_init_sta(void)
 
 static i2c_master_bus_handle_t s_i2c_bus;
 static ssd1306_handle_t        s_oled;
-
-static void i2c_scan(i2c_master_bus_handle_t bus)
-{
-    ESP_LOGI("i2c_scan", "Scanning...");
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        esp_err_t ret = i2c_master_probe(bus, addr, 50);
-        if (ret == ESP_OK) {
-            ESP_LOGI("i2c_scan", "Found device at 0x%02X", addr);
-        }
-    }
-    ESP_LOGI("i2c_scan", "Done.");
-}
 
 static void oled_init(void)
 {
@@ -227,7 +201,7 @@ static void oled_init(void)
         .flags.enable_internal_pullup = true,
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c_bus));
-    i2c_scan(s_i2c_bus);
+
     /* k0i05/esp_ssd1306 init — adjust if your component version differs */
     ssd1306_config_t oled_cfg = {
         .i2c_address = OLED_ADDR,
@@ -252,7 +226,7 @@ static void oled_task(void *arg)
     oled_init();
     oled_msg_t m;
     while (1) {
-        if (xQueueReceive(oled_q, &m, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(oled_q, &m, pdMS_TO_TICKS(2000)) == pdTRUE) {
             oled_show_status(m.line1, m.line2);
         }
     }
@@ -337,7 +311,6 @@ void telegram_send(const char *text)
         .url               = url,
         .method            = HTTP_METHOD_POST,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms        = 10000,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     esp_http_client_set_header(cli, "Content-Type",
@@ -363,7 +336,6 @@ static void telegram_poll_task(void *arg)
             .url               = url,
             .method            = HTTP_METHOD_GET,
             .crt_bundle_attach = esp_crt_bundle_attach,
-            .timeout_ms        = 30000,
         };
         esp_http_client_handle_t cli = esp_http_client_init(&cfg);
         esp_http_client_set_method(cli, HTTP_METHOD_GET);
@@ -381,7 +353,6 @@ static void telegram_poll_task(void *arg)
                     ESP_LOGI("tg", "HTTP GET Status = %d, content_length = %d",
                     esp_http_client_get_status_code(cli),
                     esp_http_client_get_content_length(cli));
-                    //ESP_LOG_BUFFER_HEX("tg", output_buffer, strlen(output_buffer));
                     for(int i = 0; i < esp_http_client_get_content_length(cli); i++) {
                         putchar(output_buffer[i]);
                     }
@@ -396,7 +367,10 @@ static void telegram_poll_task(void *arg)
                         last_message_id = update.message_id;
                         ESP_LOGI("tg", "Received message: %s", update.text);
                         if (strcmp(update.text, "ok") == 0) {
-                            if (curr_state == STATE_TAKEN) {
+                            char state_str[32];
+                            state_to_string(get_state(), state_str, sizeof(state_str));
+                            ESP_LOGI("tg", "Marking as taken %s", state_str);
+                            if (get_state() == STATE_TAKEN) {
                                 telegram_send("Already taken today!");
                             } else {
                                 set_state(STATE_TAKEN);
@@ -419,6 +393,78 @@ static void telegram_poll_task(void *arg)
 }
 
 /* -----------------------------------------------------------------------
+ * Time keeping
+ * ----------------------------------------------------------------------- */
+
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
+
+void initialize_sntp() {
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+}
+
+void time_init() {
+    initialize_sntp();
+    // Wait for time to be set before proceeding
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    int retries = 0;
+    char strftime_buf[64];
+
+    while (timeinfo.tm_year < (2020 - 1900) && retries++ < 30) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        time(&now);
+        localtime_r(&now, &timeinfo);
+    }
+
+    time(&now);
+    // Set timezone to Rome Standard Time
+    setenv("TZ", "UTC-2", 1);
+    tzset();
+
+    localtime_r(&now, &timeinfo);
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI("time", "The current date/time in Rome is: %s", strftime_buf);
+}
+
+static void set_urgent_state()
+{
+    set_state(STATE_URGENT);
+    ESP_LOGI("alarm", "21:00 — becomes urgent!");
+    //telegram_send("test!");
+}
+
+void time_task(void *arg) {
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    while (1) {
+        time_t now;
+        struct tm ti;
+        char hms[16];
+
+        time(&now);
+        localtime_r(&now, &ti);
+        strftime(hms, sizeof(hms), "%H:%M:%S", &ti);
+        /* If taken goes to Idle,
+        *  if 21:00 goes to Urgent
+        *
+        */
+        if (strcmp(hms, "23:59:00") >= 0) {
+            set_state(STATE_IDLE);
+        } else if (get_state() == STATE_IDLE && strcmp(hms, "21:00:00") >= 0) {
+            set_urgent_state();
+        }
+        char state_str[32];
+        state_to_string(get_state(), state_str, sizeof(state_str));
+        oled_update(hms, state_str);
+        vTaskDelay(pdMS_TO_TICKS(60000)); // Update every minute
+    }
+}
+
+
+/* -----------------------------------------------------------------------
  * Entry point
  * ----------------------------------------------------------------------- */
 void app_main(void)
@@ -427,17 +473,18 @@ void app_main(void)
 
     ESP_ERROR_CHECK(secrets_load(&sec));
     oled_q = xQueueCreate(8, sizeof(oled_msg_t));
-    xTaskCreate(oled_task, "oled", 4096, NULL, 4, NULL);
+    xTaskCreate(oled_task, "oled", 4096, NULL, 3, NULL);
 
     // Init the state mutex before any tasks start using it
     state_mtx = xSemaphoreCreateMutex();
     set_state(STATE_INITIALIZING);
-    vTaskDelay(pdMS_TO_TICKS(2000));  /* just to show the connected state for a moment */
-    next_state();  /* move to STATE_WIFI_CONNECTING */
-
+    oled_update("Initializing...", "Please wait");
     wifi_init_sta();           /* blocks until IP obtained */
-    next_state();  /* move to STATE_WIFI_CONNECTED */
-    vTaskDelay(pdMS_TO_TICKS(2000));  /* just to show the connected state for a moment */
-    next_state();  /* move to STATE_IDLE */
-    xTaskCreate(telegram_poll_task, "tg_rx", 8192, NULL, 5, NULL);
+
+    set_state(STATE_IDLE);  /* move to STATE_WIFI_CONNECTED */
+    oled_update("Connected", "Please wait");
+    time_init();
+    xTaskCreate(time_task, "time", 2048, NULL, 1, NULL);
+
+    xTaskCreate(telegram_poll_task, "tg_rx", 8192, NULL, 2, NULL);
 }
