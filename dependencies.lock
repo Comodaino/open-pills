@@ -2,7 +2,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 6.0.1
+    version: 6.1.0
   k0i05/esp_ssd1306:
     component_hash: 0bda01e422bdefe42b0760b2e3d3e840d57f5adc555fe40a267ecb918d9b63a2
     dependencies:

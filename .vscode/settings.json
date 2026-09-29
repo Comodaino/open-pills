@@ -5,7 +5,7 @@
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
   "idf.port": "/dev/ttyUSB0",
-  "idf.currentSetup": "/home/comodino/.espressif/v6.0.1/esp-idf",
+  "idf.currentSetup": "/home/comodino/.espressif/v6.1/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
